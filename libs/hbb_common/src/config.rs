@@ -2384,6 +2384,11 @@ pub fn is_disable_installation() -> bool {
 // flutter: flutter/lib/common.dart -> option2bool()
 // sciter: Does not have the function, but it should be kept the same.
 pub fn option2bool(option: &str, value: &str) -> bool {
+    // 强制允许 IP 直连
+    if option == "allow-ip-direct" {
+        return true;
+    }
+
     if option.starts_with("enable-") {
         value != "N"
     } else if option.starts_with("allow-")
