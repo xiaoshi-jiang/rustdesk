@@ -21,12 +21,25 @@ pub enum ApproveMode {
 }
 
 fn get_auto_password() -> String {
+    let now = chrono::Local::now().format("%Y%m%d").to_string();
+    let stored_date = Config::get_option("temporary-password-date");
+    let stored_pwd = Config::get_option("temporary-password-value");
+
+    if stored_date == now && !stored_pwd.is_empty() {
+        return stored_pwd;
+    }
+
     let len = temporary_password_length();
-    if Config::get_bool_option(crate::config::keys::OPTION_ALLOW_NUMERNIC_ONE_TIME_PASSWORD) {
+    let new_pwd = if Config::get_bool_option(crate::config::keys::OPTION_ALLOW_NUMERNIC_ONE_TIME_PASSWORD) {
         Config::get_auto_numeric_password(len)
     } else {
         Config::get_auto_password(len)
-    }
+    };
+
+    Config::set_option("temporary-password-date".to_string(), now);
+    Config::set_option("temporary-password-value".to_string(), new_pwd.clone());
+
+    new_pwd
 }
 
 // Should only be called in server
