@@ -23,6 +23,9 @@ pub mod win_mag;
 #[cfg(windows)]
 pub mod win_topmost_window;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 #[cfg(windows)]
 mod win_virtual_display;
 #[cfg(windows)]
@@ -72,6 +75,11 @@ pub trait PrivacyMode: Sync + Send {
         Ok(false)
     }
 
+    /// `INVALID_PRIVACY_MODE_CONN_ID` deliberately bypasses the ownership check, meaning
+    /// "turn it off whoever owns it": shutdown (`ipc::Data::Close`), `reset_all`, and
+    /// `TurnOnGuard`, which undoes a half-finished turn-on however far it got. A caller
+    /// acting for one connection must pass that connection's own id, or it can turn off
+    /// privacy mode belonging to another.
     #[inline]
     fn check_off_conn_id(&self, conn_id: i32) -> ResultType<()> {
         let pre_conn_id = self.pre_conn_id();
@@ -105,7 +113,14 @@ lazy_static::lazy_static! {
         }
         #[cfg(not(windows))]
         {
-            "".to_owned()
+            #[cfg(target_os = "macos")]
+            {
+                macos::PRIVACY_MODE_IMPL.to_owned()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                "".to_owned()
+            }
         }
     };
 
@@ -127,7 +142,13 @@ pub type PrivacyModeCreator = fn(impl_key: &str) -> Box<dyn PrivacyMode>;
 lazy_static::lazy_static! {
     static ref PRIVACY_MODE_CREATOR: Arc<Mutex<HashMap<&'static str, PrivacyModeCreator>>> = {
         #[cfg(not(windows))]
-        let map: HashMap<&'static str, PrivacyModeCreator> = HashMap::new();
+        let mut map: HashMap<&'static str, PrivacyModeCreator> = HashMap::new();
+        #[cfg(target_os = "macos")]
+        {
+            map.insert(macos::PRIVACY_MODE_IMPL, |impl_key: &str| {
+                Box::new(macos::PrivacyModeImpl::new(impl_key))
+            });
+        }
         #[cfg(windows)]
         let mut map: HashMap<&'static str, PrivacyModeCreator> = HashMap::new();
         #[cfg(windows)]
@@ -273,6 +294,29 @@ fn turn_on_privacy_sync(impl_key: &str, conn_id: i32) -> Option<ResultType<bool>
     Some(privacy_mode_lock.as_mut()?.turn_on_privacy(conn_id))
 }
 
+#[cfg(not(target_os = "ios"))]
+pub(crate) fn close_other_remote_connections_for_privacy(owner_id: i32) {
+    use crate::server::{AuthConnType, AUTHED_CONNS};
+
+    let privacy_mode_lock = PRIVACY_MODE.lock().unwrap();
+    // Ownership can change while the caller validates the capturer.
+    if privacy_mode_lock.as_ref().map(|mode| mode.pre_conn_id()) != Some(owner_id) {
+        return;
+    }
+    for connection in AUTHED_CONNS.lock().unwrap().iter() {
+        if connection.conn_type != AuthConnType::Remote || connection.conn_id == owner_id {
+            continue;
+        }
+        if let Err(err) = connection.sender.send(crate::ipc::Data::Close) {
+            hbb_common::log::debug!(
+                "Failed to close connection {} for privacy mode: {}",
+                connection.conn_id,
+                err
+            );
+        }
+    }
+}
+
 #[inline]
 pub fn turn_off_privacy(conn_id: i32, state: Option<PrivacyModeState>) -> Option<ResultType<()>> {
     Some(
@@ -333,7 +377,14 @@ pub fn get_supported_privacy_mode_impl() -> Vec<(&'static str, &'static str)> {
 
         vec_impls
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        // No translation is intended for privacy_mode_impl_macos_tip as it is a 
+        // placeholder for macOS specific privacy mode implementation which currently
+        // doesn't provide multiple modes like Windows does.
+        vec![(macos::PRIVACY_MODE_IMPL, "privacy_mode_impl_macos_tip")]
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         Vec::new()
     }

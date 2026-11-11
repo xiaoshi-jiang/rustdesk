@@ -11,7 +11,7 @@ use nokhwa::{
     Camera,
 };
 
-use hbb_common::message_proto::{DisplayInfo, Resolution};
+use base::message_proto::{DisplayInfo, Resolution};
 
 #[cfg(feature = "vram")]
 use crate::AdapterDevice;
@@ -268,12 +268,12 @@ impl TraitCapturer for CameraCapturer {
 
     #[cfg(windows)]
     fn is_gdi(&self) -> bool {
-        false
+        true
     }
 
     #[cfg(windows)]
     fn set_gdi(&mut self) -> bool {
-        false
+        true
     }
 
     #[cfg(feature = "vram")]

@@ -1,18 +1,14 @@
-use std::{
-    io::Error as IoError,
-    net::{SocketAddr, ToSocketAddrs},
-};
+use std::{io::Error as IoError, net::SocketAddr};
 
+use anyhow::bail;
+use async_recursion::async_recursion;
 use base64::{engine::general_purpose, Engine};
 use httparse::{Error as HttpParseError, Response, EMPTY_HEADER};
-use log::info;
 use thiserror::Error as ThisError;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufStream};
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 use tokio_native_tls::{native_tls, TlsConnector, TlsStream};
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-use tokio_rustls::{client::TlsStream, TlsConnector};
-use tokio_socks::{tcp::Socks5Stream, IntoTargetAddr};
+use tokio_rustls::{client::TlsStream as RustlsTlsStream, TlsConnector as RustlsTlsConnector};
+use tokio_socks::{tcp::Socks5Stream, IntoTargetAddr, TargetAddr};
 use tokio_util::codec::Framed;
 use url::Url;
 
@@ -20,6 +16,7 @@ use crate::{
     bytes_codec::BytesCodec,
     config::Socks5Server,
     tcp::{DynTcpStream, FramedStream},
+    tls::{get_cached_tls_accept_invalid_cert, get_cached_tls_type, upsert_tls_cache, TlsType},
     ResultType,
 };
 
@@ -45,7 +42,6 @@ pub enum ProxyError {
     HttpCode200(u16),
     #[error("The proxy address resolution failed: {0}")]
     AddressResolutionFailed(String),
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[error("The native tls error: {0}")]
     NativeTlsError(#[from] tokio_native_tls::native_tls::Error),
 }
@@ -56,7 +52,6 @@ const MAXIMUM_RESPONSE_HEADERS: usize = 16;
 const DEFINE_TIME_OUT: u64 = 600;
 
 pub trait IntoUrl {
-
     // Besides parsing as a valid `Url`, the `Url` must be a valid
     // `http::Uri`, in that it makes sense to use in a network request.
     fn into_url(self) -> Result<Url, ProxyError>;
@@ -127,6 +122,14 @@ impl Auth {
     pub fn get_basic_authorization(&self) -> String {
         let authorization = format!("{}:{}", &self.user_name, &self.password);
         general_purpose::STANDARD.encode(authorization.as_bytes())
+    }
+
+    pub fn username(&self) -> &str {
+        &self.user_name
+    }
+
+    pub fn password(&self) -> &str {
+        &self.password
     }
 }
 
@@ -219,7 +222,7 @@ impl ProxyScheme {
         Ok(scheme)
     }
     pub async fn socket_addrs(&self) -> Result<SocketAddr, ProxyError> {
-        info!("Resolving socket address");
+        log::trace!("Resolving socket address");
         match self {
             ProxyScheme::Http { host, .. } => self.resolve_host(host, 80).await,
             ProxyScheme::Https { host, .. } => self.resolve_host(host, 443).await,
@@ -228,12 +231,10 @@ impl ProxyScheme {
     }
 
     async fn resolve_host(&self, host: &str, default_port: u16) -> Result<SocketAddr, ProxyError> {
-        let (host_str, port) = match host.split_once(':') {
-            Some((h, p)) => (h, p.parse::<u16>().ok()),
-            None => (host, None),
-        };
-        let addr = (host_str, port.unwrap_or(default_port))
-            .to_socket_addrs()?
+        let addr = self
+            .http_url(host)?
+            .socket_addrs(|| Some(default_port))?
+            .into_iter()
             .next()
             .ok_or_else(|| ProxyError::AddressResolutionFailed(host.to_string()))?;
         Ok(addr)
@@ -242,11 +243,11 @@ impl ProxyScheme {
     pub fn get_domain(&self) -> Result<String, ProxyError> {
         match self {
             ProxyScheme::Http { host, .. } | ProxyScheme::Https { host, .. } => {
-                let domain = host
-                    .split(':')
-                    .next()
-                    .ok_or_else(|| ProxyError::AddressResolutionFailed(host.clone()))?;
-                Ok(domain.to_string())
+                match self.http_url(host)?.host() {
+                    Some(url::Host::Ipv6(ip)) => Ok(ip.to_string()),
+                    Some(host) => Ok(host.to_string()),
+                    None => Err(ProxyError::AddressResolutionFailed(host.clone())),
+                }
             }
             ProxyScheme::Socks5 { addr, .. } => match addr {
                 SocketAddr::V4(addr_v4) => Ok(addr_v4.ip().to_string()),
@@ -256,17 +257,30 @@ impl ProxyScheme {
     }
     pub fn get_host_and_port(&self) -> Result<String, ProxyError> {
         match self {
-            ProxyScheme::Http { host, .. } => Ok(self.append_default_port(host, 80)),
-            ProxyScheme::Https { host, .. } => Ok(self.append_default_port(host, 443)),
+            ProxyScheme::Http { host, .. } => self.append_default_port(host, 80),
+            ProxyScheme::Https { host, .. } => self.append_default_port(host, 443),
             ProxyScheme::Socks5 { addr, .. } => Ok(format!("{}", addr)),
         }
     }
-    fn append_default_port(&self, host: &str, default_port: u16) -> String {
-        if host.contains(':') {
-            host.to_string()
+    fn append_default_port(&self, host: &str, default_port: u16) -> Result<String, ProxyError> {
+        let url = self.http_url(host)?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| ProxyError::AddressResolutionFailed(host.to_string()))?;
+        Ok(format!(
+            "{}:{}",
+            host,
+            url.port_or_known_default().unwrap_or(default_port)
+        ))
+    }
+
+    fn http_url(&self, host: &str) -> Result<Url, ProxyError> {
+        let scheme = if matches!(self, Self::Https { .. }) {
+            "https"
         } else {
-            format!("{}:{}", host, default_port)
-        }
+            "http"
+        };
+        Ok(Url::parse(&format!("{scheme}://{host}"))?)
     }
 }
 
@@ -349,16 +363,34 @@ impl Proxy {
         self
     }
 
+    async fn new_stream(
+        &self,
+        local: SocketAddr,
+        proxy: SocketAddr,
+    ) -> ResultType<tokio::net::TcpStream> {
+        let stream = super::timeout(
+            self.ms_timeout,
+            crate::tcp::new_socket(local, true)?.connect(proxy),
+        )
+        .await??;
+        stream.set_nodelay(true).ok();
+        Ok(stream)
+    }
+
     pub async fn connect<'t, T>(
-        self,
+        &self,
         target: T,
         local_addr: Option<SocketAddr>,
     ) -> ResultType<FramedStream>
     where
         T: IntoTargetAddr<'t>,
     {
-        info!("Connect to proxy server");
+        log::trace!("Connect to proxy server");
         let proxy = self.proxy_addrs().await?;
+
+        let target_addr = target
+            .into_target_addr()
+            .map_err(|e| ProxyError::TargetParseError(e.to_string()))?;
 
         let local = if let Some(addr) = local_addr {
             addr
@@ -366,20 +398,15 @@ impl Proxy {
             crate::config::Config::get_any_listen_addr(proxy.is_ipv4())
         };
 
-        let stream = super::timeout(
-            self.ms_timeout,
-            crate::tcp::new_socket(local, true)?.connect(proxy),
-        )
-        .await??;
-        stream.set_nodelay(true).ok();
-
+        let stream = self.new_stream(local, proxy).await?;
         let addr = stream.local_addr()?;
 
         return match self.intercept {
             ProxyScheme::Http { .. } => {
-                info!("Connect to remote http proxy server: {}", proxy);
+                log::trace!("Connect to remote http proxy server: {}", proxy);
                 let stream =
-                    super::timeout(self.ms_timeout, self.http_connect(stream, target)).await??;
+                    super::timeout(self.ms_timeout, self.http_connect(stream, &target_addr))
+                        .await??;
                 Ok(FramedStream(
                     Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
                     addr,
@@ -388,24 +415,53 @@ impl Proxy {
                 ))
             }
             ProxyScheme::Https { .. } => {
-                info!("Connect to remote https proxy server: {}", proxy);
-                let stream =
-                    super::timeout(self.ms_timeout, self.https_connect(stream, target)).await??;
+                log::trace!("Connect to remote https proxy server: {}", proxy);
+                let url = format!("https://{}", self.intercept.get_host_and_port()?);
+                let tls_type = get_cached_tls_type(&url);
+                let danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(&url);
+                let stream = match tls_type.unwrap_or(TlsType::Rustls) {
+                    TlsType::Rustls => {
+                        self.https_connect_rustls_wrap_danger(
+                            &url,
+                            local,
+                            proxy,
+                            Some(stream),
+                            &target_addr,
+                            tls_type.is_some(),
+                            danger_accept_invalid_cert,
+                            danger_accept_invalid_cert,
+                        )
+                        .await?
+                    }
+                    TlsType::NativeTls => {
+                        self.https_connect_nativetls_wrap_danger(
+                            &url,
+                            stream,
+                            &target_addr,
+                            danger_accept_invalid_cert,
+                        )
+                        .await?
+                    }
+                    _ => {
+                        // Unreachable
+                        crate::bail!("Unreachable, TlsType::Plain in HTTPS proxy");
+                    }
+                };
                 Ok(FramedStream(
-                    Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+                    Framed::new(stream, BytesCodec::new()),
                     addr,
                     None,
                     0,
                 ))
             }
             ProxyScheme::Socks5 { .. } => {
-                info!("Connect to remote socket5 proxy server: {}", proxy);
+                log::trace!("Connect to remote socket5 proxy server: {}", proxy);
                 let stream = if let Some(auth) = self.intercept.maybe_auth() {
                     super::timeout(
                         self.ms_timeout,
                         Socks5Stream::connect_with_password_and_socket(
                             stream,
-                            target,
+                            target_addr,
                             &auth.user_name,
                             &auth.password,
                         ),
@@ -414,7 +470,7 @@ impl Proxy {
                 } else {
                     super::timeout(
                         self.ms_timeout,
-                        Socks5Stream::connect_with_socket(stream, target),
+                        Socks5Stream::connect_with_socket(stream, target_addr),
                     )
                     .await??
                 };
@@ -428,57 +484,166 @@ impl Proxy {
         };
     }
 
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    pub async fn https_connect<'a, Input, T>(
-        self,
+    async fn https_connect_nativetls_wrap_danger<'a>(
+        &self,
+        url: &str,
+        stream: tokio::net::TcpStream,
+        target_addr: &TargetAddr<'a>,
+        danger_accept_invalid_cert: Option<bool>,
+    ) -> ResultType<DynTcpStream> {
+        let s = super::timeout(
+            self.ms_timeout,
+            self.https_connect_nativetls(
+                stream,
+                &target_addr,
+                danger_accept_invalid_cert.unwrap_or(false),
+            ),
+        )
+        .await??;
+        upsert_tls_cache(
+            url,
+            TlsType::NativeTls,
+            danger_accept_invalid_cert.unwrap_or(false),
+        );
+        Ok(DynTcpStream(Box::new(s)))
+    }
+
+    pub async fn https_connect_nativetls<'a, Input>(
+        &self,
         io: Input,
-        target: T,
+        target_addr: &TargetAddr<'a>,
+        danger_accept_invalid_cert: bool,
     ) -> Result<BufStream<TlsStream<Input>>, ProxyError>
     where
         Input: AsyncRead + AsyncWrite + Unpin,
-        T: IntoTargetAddr<'a>,
     {
-        let tls_connector = TlsConnector::from(native_tls::TlsConnector::new()?);
+        let mut tls_connector_builder = native_tls::TlsConnector::builder();
+        if danger_accept_invalid_cert {
+            tls_connector_builder.danger_accept_invalid_certs(true);
+        }
+        let tls_connector = TlsConnector::from(tls_connector_builder.build()?);
         let stream = tls_connector
             .connect(&self.intercept.get_domain()?, io)
             .await?;
-        self.http_connect(stream, target).await
+        self.http_connect(stream, target_addr).await
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    pub async fn https_connect<'a, Input, T>(
-        self,
+    #[async_recursion]
+    async fn https_connect_rustls_wrap_danger<'a>(
+        &self,
+        url: &str,
+        local: SocketAddr,
+        proxy: SocketAddr,
+        stream: Option<tokio::net::TcpStream>,
+        target_addr: &TargetAddr<'a>,
+        is_tls_type_cached: bool,
+        danger_accept_invalid_cert: Option<bool>,
+        origin_danger_accept_invalid_cert: Option<bool>,
+    ) -> ResultType<DynTcpStream> {
+        let stream = match stream {
+            Some(stream) => stream,
+            None => self.new_stream(local, proxy).await?,
+        };
+        match super::timeout(
+            self.ms_timeout,
+            self.https_connect_rustls(
+                stream,
+                target_addr,
+                danger_accept_invalid_cert.unwrap_or(false),
+            ),
+        )
+        .await?
+        {
+            Ok(s) => {
+                upsert_tls_cache(
+                    &url,
+                    TlsType::Rustls,
+                    danger_accept_invalid_cert.unwrap_or(false),
+                );
+                Ok(DynTcpStream(Box::new(s)))
+            }
+            Err(e) => {
+                // NOTE: Maybe it's better to check if the error is related to TLS here. (ProxyError::IoError(e), or ProxyError::NativeTlsError(e))
+                // But we can only get the error when the TLS protocol is TLSv1.1.
+                // The error message of the following is unclear:
+                // https://github.com/rustdesk/rustdesk-server-pro/issues/189#issuecomment-1895701480
+                // So we just try to fallback unconditionally here.
+                //
+                // If the protocol is TLS 1.1, the error is:
+                // 1. "IO Error: received fatal alert: ProtocolVersion"
+                // 2. "IO Error: An existing connection was forcibly closed by the remote host. (os error 10054)" on Windows sometimes.
+                //
+                // If the cert verification fails, the error is:
+                // "IO Error: invalid peer certificate: UnknownIssuer"
+
+                let s = if danger_accept_invalid_cert.is_none() {
+                    log::warn!(
+                        "Falling back to rustls-tls (accept invalid cert) for HTTPS proxy server."
+                    );
+                    self.https_connect_rustls_wrap_danger(
+                        &url,
+                        local,
+                        proxy,
+                        None,
+                        target_addr,
+                        is_tls_type_cached,
+                        Some(true),
+                        origin_danger_accept_invalid_cert,
+                    )
+                    .await?
+                } else if !is_tls_type_cached {
+                    log::warn!("Falling back to native-tls for HTTPS proxy server.");
+                    self.https_connect_nativetls_wrap_danger(
+                        &url,
+                        self.new_stream(local, proxy).await?,
+                        &target_addr,
+                        origin_danger_accept_invalid_cert,
+                    )
+                    .await?
+                } else {
+                    log::error!(
+                        "Failed to connect to HTTPS proxy server with native-tls: {:?}.",
+                        e
+                    );
+                    bail!(e)
+                };
+                Ok(s)
+            }
+        }
+    }
+
+    pub async fn https_connect_rustls<'a, Input>(
+        &self,
         io: Input,
-        target: T,
-    ) -> Result<BufStream<TlsStream<Input>>, ProxyError>
+        target_addr: &TargetAddr<'a>,
+        danger_accept_invalid_cert: bool,
+    ) -> Result<BufStream<RustlsTlsStream<Input>>, ProxyError>
     where
         Input: AsyncRead + AsyncWrite + Unpin,
-        T: IntoTargetAddr<'a>,
     {
         use std::convert::TryFrom;
-        let verifier = rustls_platform_verifier::tls_config();
-        let url_domain = self.intercept.get_domain()?;
 
+        let url_domain = self.intercept.get_domain()?;
         let domain = rustls_pki_types::ServerName::try_from(url_domain.as_str())
             .map_err(|e| ProxyError::AddressResolutionFailed(e.to_string()))?
             .to_owned();
-
-        let tls_connector = TlsConnector::from(std::sync::Arc::new(verifier));
+        let client_config = crate::verifier::client_config(danger_accept_invalid_cert)
+            .map_err(|e| ProxyError::IoError(std::io::Error::other(e)))?;
+        let tls_connector = RustlsTlsConnector::from(std::sync::Arc::new(client_config));
         let stream = tls_connector.connect(domain, io).await?;
-        self.http_connect(stream, target).await
+        self.http_connect(stream, target_addr).await
     }
 
-    pub async fn http_connect<'a, Input, T>(
-        self,
+    pub async fn http_connect<'a, Input>(
+        &self,
         io: Input,
-        target: T,
+        target_addr: &TargetAddr<'a>,
     ) -> Result<BufStream<Input>, ProxyError>
     where
         Input: AsyncRead + AsyncWrite + Unpin,
-        T: IntoTargetAddr<'a>,
     {
         let mut stream = BufStream::new(io);
-        let (domain, port) = get_domain_and_port(target)?;
+        let (domain, port) = get_domain_and_port(target_addr)?;
 
         let request = self.make_request(&domain, port);
         stream.write_all(request.as_bytes()).await?;
@@ -503,13 +668,14 @@ impl Proxy {
     }
 }
 
-fn get_domain_and_port<'a, T: IntoTargetAddr<'a>>(target: T) -> Result<(String, u16), ProxyError> {
-    let target_addr = target
-        .into_target_addr()
-        .map_err(|e| ProxyError::TargetParseError(e.to_string()))?;
+fn get_domain_and_port<'a>(target_addr: &TargetAddr<'a>) -> Result<(String, u16), ProxyError> {
     match target_addr {
+        // CONNECT requires brackets around IPv6 literals in both the target and Host header.
+        tokio_socks::TargetAddr::Ip(SocketAddr::V6(addr)) => {
+            Ok((format!("[{}]", addr.ip()), addr.port()))
+        }
         tokio_socks::TargetAddr::Ip(addr) => Ok((addr.ip().to_string(), addr.port())),
-        tokio_socks::TargetAddr::Domain(name, port) => Ok((name.to_string(), port)),
+        tokio_socks::TargetAddr::Domain(name, port) => Ok((name.to_string(), *port)),
     }
 }
 
@@ -558,4 +724,103 @@ where
         }
         None => Err(ProxyError::NoHttpCode),
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProxyScheme;
+
+    #[test]
+    fn http_url_parses_hosts_and_ports() {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            for (proxy, scheme, default_port) in [
+                (ProxyScheme::http(host).unwrap(), "http", 80),
+                (ProxyScheme::https(host).unwrap(), "https", 443),
+            ] {
+                for port in [None, Some(80), Some(443), Some(8443)] {
+                    let authority = match port {
+                        Some(port) => format!("{host}:{port}"),
+                        None => host.to_owned(),
+                    };
+                    let url = proxy.http_url(&authority).unwrap();
+                    assert_eq!(url.scheme(), scheme);
+                    assert_eq!(url.host_str(), Some(host));
+                    assert_eq!(
+                        url.port_or_known_default(),
+                        Some(port.unwrap_or(default_port))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn append_default_port_formats_hosts_and_ports() {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            for (proxy, default_port) in [
+                (ProxyScheme::http(host).unwrap(), 80),
+                (ProxyScheme::https(host).unwrap(), 443),
+            ] {
+                for port in [None, Some(80), Some(443), Some(8443)] {
+                    let authority = match port {
+                        Some(port) => format!("{host}:{port}"),
+                        None => host.to_owned(),
+                    };
+                    assert_eq!(
+                        proxy.append_default_port(&authority, default_port).unwrap(),
+                        format!("{host}:{}", port.unwrap_or(default_port))
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_host_resolves_hosts_and_ports() {
+        for (host, expected_ip) in [
+            ("localhost", None),
+            ("127.0.0.1", Some("127.0.0.1")),
+            ("[::1]", Some("::1")),
+        ] {
+            for (proxy, default_port) in [
+                (ProxyScheme::http(host).unwrap(), 80),
+                (ProxyScheme::https(host).unwrap(), 443),
+            ] {
+                for port in [None, Some(80), Some(443), Some(8443)] {
+                    let authority = match port {
+                        Some(port) => format!("{host}:{port}"),
+                        None => host.to_owned(),
+                    };
+                    let addr = proxy.resolve_host(&authority, default_port).await.unwrap();
+                    assert_eq!(addr.port(), port.unwrap_or(default_port));
+                    assert!(addr.ip().is_loopback());
+                    if let Some(ip) = expected_ip {
+                        assert_eq!(addr.ip().to_string(), ip);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn get_domain_strips_ports_and_ipv6_brackets() {
+        for (host, domain) in [
+            ("localhost", "localhost"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("[::1]", "::1"),
+        ] {
+            for port in [None, Some(80), Some(443), Some(8443)] {
+                let authority = match port {
+                    Some(port) => format!("{host}:{port}"),
+                    None => host.to_owned(),
+                };
+                for proxy in [
+                    ProxyScheme::http(&authority).unwrap(),
+                    ProxyScheme::https(&authority).unwrap(),
+                ] {
+                    assert_eq!(proxy.get_domain().unwrap(), domain);
+                }
+            }
+        }
+    }
 }
